@@ -1,0 +1,16 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'io.github.ksuzukigh.phototomac'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'io.github.ksuzukigh.phototomac'
+        minSdk 32
+        targetSdk 32
+        versionCode 1
+        versionName '0.1'
+    }
+}
