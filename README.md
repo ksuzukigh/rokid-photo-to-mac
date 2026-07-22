@@ -97,6 +97,8 @@ Macから操作する別のツールがなくても、Rokid単体でWi-Fiを戻�
 
 なお、別公開の[Mac操作ツール](https://github.com/ksuzukigh/rokid-mac-control)を使用中は、Wi-Fiがオフになったときの自動復旧も利用できます。ただし、この写真転送アプリだけでも上記の手順で使用できます。
 
+より簡単に、アプリを開くだけでWi-Fiを戻したい場合は、別公開の[Wi-Fi ON](https://github.com/ksuzukigh/rokid-wifi-on)を利用できます。Wi-Fi ONを入れなくても、Photo to Mac自身の「設定画面＋テンプル1回」の復旧機能はそのまま使えます。
+
 ## 送れないとき
 
 - MacとRokidが同じWi-Fiにつながっているか確認します。
