@@ -95,7 +95,7 @@ public final class MainActivity extends Activity {
         panel.addView(title);
 
         status = new TextView(this);
-        status.setText("未撮影\nタップで撮る");
+        status.setText("タップして撮影します");
         status.setTextColor(Color.WHITE);
         status.setTextSize(28);
         status.setGravity(Gravity.CENTER);
@@ -125,12 +125,12 @@ public final class MainActivity extends Activity {
             if (waitingForWifi && isWifiEnabled()) {
                 android.util.Log.i(TAG, "Returned from Wi-Fi settings; Wi-Fi is enabled");
                 waitingForWifi = false;
-                setStatus("Wi-Fiをオンにしました\nタップで撮る");
+                setStatus("Wi-Fiをオンにしました\nタップして撮影します");
             } else if (waitingForWifi) {
                 android.util.Log.i(TAG, "Returned from Wi-Fi settings; Wi-Fi is still off");
                 setStatus("Wi-Fiはオフです\nタップして設定");
             } else {
-                setStatus("未撮影\nタップで撮る");
+                setStatus("タップして撮影します");
             }
         }
     }
