@@ -15,10 +15,14 @@ import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.Image;
 import android.media.ImageReader;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.net.wifi.WifiManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.Looper;
 import android.provider.Settings;
 import android.view.KeyEvent;
 import android.view.Surface;
@@ -28,7 +32,8 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.DatagramPacket;
@@ -72,12 +77,20 @@ public final class MainActivity extends Activity {
     private HandlerThread cameraThread;
     private Handler cameraHandler;
     private final ExecutorService network = Executors.newSingleThreadExecutor();
+    private final Handler watchdog = new Handler(Looper.getMainLooper());
     private volatile boolean busy = false;
+    private volatile boolean awaitingImage = false;
+    private final Runnable captureTimeout = () -> {
+        if (busy && awaitingImage) {
+            done("撮影できませんでした\nもう一度タップしてください");
+        }
+    };
     private boolean waitingForWifi = false;
-    private CameraDevice openCamera;
-    private CameraCaptureSession captureSession;
-    private ImageReader imageReader;
-    private Surface previewSurface;
+    private volatile CameraDevice openCamera;
+    private volatile CameraCaptureSession captureSession;
+    private volatile ImageReader imageReader;
+    private volatile Surface previewSurface;
+    private volatile SurfaceTexture previewTexture;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -142,13 +155,15 @@ public final class MainActivity extends Activity {
     @Override protected void onResume() {
         super.onResume();
         if (!busy && status != null) {
-            if (waitingForWifi && isWifiEnabled()) {
-                android.util.Log.i(TAG, "Returned from Wi-Fi settings; Wi-Fi is enabled");
+            if (waitingForWifi && isWifiConnected()) {
+                android.util.Log.i(TAG, "Returned from Wi-Fi settings; Wi-Fi is connected");
                 waitingForWifi = false;
-                setStatus("Wi-Fiをオンにしました\nタップして撮影します");
+                setStatus("Wi-Fiに接続しました\nタップして撮影します");
             } else if (waitingForWifi) {
-                android.util.Log.i(TAG, "Returned from Wi-Fi settings; Wi-Fi is still off");
-                setStatus("Wi-Fiはオフです\nタップして設定");
+                android.util.Log.i(TAG, "Returned from Wi-Fi settings; Wi-Fi is not connected");
+                setStatus(isWifiEnabled()
+                        ? "Wi-Fiに未接続です\nタップして設定"
+                        : "Wi-Fiはオフです\nタップして設定");
             } else {
                 setStatus("タップして撮影します");
             }
@@ -165,8 +180,8 @@ public final class MainActivity extends Activity {
 
     private void capture() {
         if (busy) return;
-        if (!isWifiEnabled()) {
-            if (!waitingForWifi) recoverWifi();
+        if (!isWifiEnabled() || !isWifiConnected()) {
+            recoverWifi();
             return;
         }
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
@@ -174,6 +189,9 @@ public final class MainActivity extends Activity {
             return;
         }
         busy = true;
+        awaitingImage = true;
+        watchdog.removeCallbacks(captureTimeout);
+        watchdog.postDelayed(captureTimeout, 10000);
         setStatus("1/3\n撮影中…");
         cameraThread = new HandlerThread("rokid-camera");
         cameraThread.start();
@@ -184,38 +202,53 @@ public final class MainActivity extends Activity {
             CameraCharacteristics chars = manager.getCameraCharacteristics(cameraId);
             StreamConfigurationMap map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
             android.util.Size[] sizes = map.getOutputSizes(ImageFormat.JPEG);
+            Integer sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION);
+            int jpegOrientation = sensorOrientation != null ? sensorOrientation : 270;
+            android.util.Log.i(TAG, "Using JPEG orientation " + jpegOrientation);
             android.util.Size photoSize = Arrays.stream(sizes)
                     .filter(s -> s.getWidth() <= 1920)
                     .max(Comparator.comparingInt(s -> s.getWidth() * s.getHeight()))
                     .orElse(sizes[0]);
             imageReader = ImageReader.newInstance(photoSize.getWidth(), photoSize.getHeight(), ImageFormat.JPEG, 1);
             imageReader.setOnImageAvailableListener(r -> {
+                if (!busy || !awaitingImage) return;
                 try (Image image = r.acquireNextImage()) {
-                    if (image == null) return;
-                    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+                    if (image == null) {
+                        done("写真を取得できませんでした");
+                        return;
+                    }
+                    awaitingImage = false;
+                    watchdog.removeCallbacks(captureTimeout);
                     java.nio.ByteBuffer buffer = image.getPlanes()[0].getBuffer();
                     byte[] data = new byte[buffer.remaining()];
+                    // Copy the JPEG before releasing the camera resources.
                     buffer.get(data);
-                    bytes.write(data);
                     closeCamera();
-                    upload(bytes.toByteArray());
-                } catch (IOException error) {
+                    upload(data);
+                } catch (Exception error) {
+                    android.util.Log.e(TAG, "Could not read captured photo", error);
                     done("写真を読めませんでした");
-                } finally {
-                    r.close();
                 }
             }, cameraHandler);
             // The RV101 needs a short preview phase for automatic exposure to settle.
-            SurfaceTexture texture = new SurfaceTexture(10);
-            texture.setDefaultBufferSize(photoSize.getWidth(), photoSize.getHeight());
-            previewSurface = new Surface(texture);
+            previewTexture = new SurfaceTexture(10);
+            previewTexture.setDefaultBufferSize(photoSize.getWidth(), photoSize.getHeight());
+            previewSurface = new Surface(previewTexture);
             manager.openCamera(cameraId, new CameraDevice.StateCallback() {
                 @Override public void onOpened(CameraDevice camera) {
+                    if (!busy || !awaitingImage) {
+                        camera.close();
+                        return;
+                    }
                     openCamera = camera;
                     try {
                         Surface jpegSurface = imageReader.getSurface();
                         camera.createCaptureSession(Arrays.asList(previewSurface, jpegSurface), new CameraCaptureSession.StateCallback() {
                             @Override public void onConfigured(CameraCaptureSession session) {
+                                if (!busy || !awaitingImage) {
+                                    session.close();
+                                    return;
+                                }
                                 try {
                                     captureSession = session;
                                     CaptureRequest.Builder preview = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
@@ -223,11 +256,11 @@ public final class MainActivity extends Activity {
                                     preview.addTarget(previewSurface);
                                     session.setRepeatingRequest(preview.build(), null, cameraHandler);
                                     cameraHandler.postDelayed(() -> {
+                                        if (!busy || !awaitingImage) return;
                                         try {
                                             CaptureRequest.Builder still = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
                                             still.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
-                                            // The camera is mounted sideways in the glasses frame.
-                                            still.set(CaptureRequest.JPEG_ORIENTATION, 270);
+                                            still.set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation);
                                             still.addTarget(jpegSurface);
                                             session.capture(still.build(), null, cameraHandler);
                                         } catch (Exception error) { done("撮影できませんでした"); }
@@ -238,8 +271,14 @@ public final class MainActivity extends Activity {
                         }, cameraHandler);
                     } catch (Exception error) { done("カメラを開けませんでした"); }
                 }
-                @Override public void onDisconnected(CameraDevice camera) { closeCamera(); done("カメラ接続が切れました"); }
-                @Override public void onError(CameraDevice camera, int error) { closeCamera(); done("カメラエラー " + error); }
+                @Override public void onDisconnected(CameraDevice camera) {
+                    openCamera = camera;
+                    done("カメラ接続が切れました");
+                }
+                @Override public void onError(CameraDevice camera, int error) {
+                    openCamera = camera;
+                    done("カメラエラー " + error);
+                }
             }, cameraHandler);
         } catch (Exception error) {
             done("カメラが見つかりませんでした");
@@ -251,11 +290,27 @@ public final class MainActivity extends Activity {
         return wifi != null && wifi.isWifiEnabled();
     }
 
+    private boolean isWifiConnected() {
+        ConnectivityManager connectivity =
+                (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (connectivity == null) return false;
+        Network network = connectivity.getActiveNetwork();
+        if (network == null) return false;
+        NetworkCapabilities capabilities = connectivity.getNetworkCapabilities(network);
+        return capabilities != null
+                && capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI);
+    }
+
     private void recoverWifi() {
         waitingForWifi = true;
-        android.util.Log.i(TAG, "Wi-Fi is off; opening Wi-Fi settings");
-        setStatus("Wi-Fiをオンにします");
-        Toast.makeText(this, "右つるタップでWi-Fiをオン", Toast.LENGTH_LONG).show();
+        boolean enabled = isWifiEnabled();
+        android.util.Log.i(TAG, "Wi-Fi is not connected; opening Wi-Fi settings");
+        setStatus(enabled ? "Wi-Fiに接続します" : "Wi-Fiをオンにします");
+        Toast.makeText(
+                this,
+                enabled ? "接続するWi-Fiを選んでください" : "右つるタップでWi-Fiをオン",
+                Toast.LENGTH_LONG
+        ).show();
         openWifiSettings();
     }
 
@@ -271,35 +326,150 @@ public final class MainActivity extends Activity {
 
     private void upload(byte[] jpeg) {
         setStatus("2/3\nMacへ送信中…");
+        String name = "rokid-"
+                + new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date())
+                + ".jpg";
         network.execute(() -> {
-            HttpURLConnection connection = null;
+            String token = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+                    .getString(TOKEN_KEY, "");
+            if (!token.matches("[0-9a-f]{32}")) {
+                finishUploadFailure(
+                        "初期設定が必要です",
+                        name,
+                        jpeg,
+                        new IOException("Pairing token is missing")
+                );
+                return;
+            }
             try {
-                String token = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
-                        .getString(TOKEN_KEY, "");
-                if (!token.matches("[0-9a-f]{32}")) {
-                    done("初期設定が必要です\nMacから入れ直してください");
-                    return;
-                }
                 String uploadUrl = discoverUploadUrl(token);
-                String name = "rokid-" + new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date()) + ".jpg";
-                connection = (HttpURLConnection) new URL(uploadUrl + "?filename=" + name).openConnection();
-                connection.setConnectTimeout(5000);
-                connection.setReadTimeout(10000);
-                connection.setRequestMethod("POST");
-                connection.setDoOutput(true);
-                connection.setFixedLengthStreamingMode(jpeg.length);
-                connection.setRequestProperty("Content-Type", "image/jpeg");
-                connection.setRequestProperty("X-Photo-Token", token);
-                try (OutputStream out = connection.getOutputStream()) { out.write(jpeg); }
-                int code = connection.getResponseCode();
-                done(code >= 200 && code < 300 ? "3/3\n✓ Macに保存しました\nタップでもう一枚" : "Macが受け取りませんでした (" + code + ")");
+                sendPhoto(uploadUrl, name, jpeg, token);
+                int resent = sendPendingPhotos(uploadUrl, token);
+                boolean pendingRemains = hasPendingPhotos();
+                if (resent > 0) {
+                    done("3/3\n✓ Macに保存しました\n未送信の写真も"
+                            + resent + "枚保存しました");
+                } else if (pendingRemains) {
+                    done("3/3\n✓ Macに保存しました\n未送信の写真は眼鏡に残っています");
+                } else {
+                    done("3/3\n✓ Macに保存しました\nタップでもう一枚");
+                }
+            } catch (ReceiverNotFoundException error) {
+                finishUploadFailure(
+                        "Macが見つかりません\n同じWi-Fiか確認してください",
+                        name,
+                        jpeg,
+                        error
+                );
             } catch (Exception error) {
-                android.util.Log.e(TAG, "Upload failed", error);
-                done("Macへ送れませんでした");
-            } finally {
-                if (connection != null) connection.disconnect();
+                finishUploadFailure("Macへ送れませんでした", name, jpeg, error);
             }
         });
+    }
+
+    private void sendPhoto(String uploadUrl, String name, byte[] jpeg, String token)
+            throws IOException {
+        HttpURLConnection connection = null;
+        try {
+            connection = (HttpURLConnection) new URL(uploadUrl + "?filename=" + name).openConnection();
+            connection.setConnectTimeout(5000);
+            connection.setReadTimeout(10000);
+            connection.setRequestMethod("POST");
+            connection.setDoOutput(true);
+            connection.setFixedLengthStreamingMode(jpeg.length);
+            connection.setRequestProperty("Content-Type", "image/jpeg");
+            connection.setRequestProperty("X-Photo-Token", token);
+            try (OutputStream out = connection.getOutputStream()) {
+                out.write(jpeg);
+            }
+            int code = connection.getResponseCode();
+            if (code < 200 || code >= 300) {
+                throw new IOException("Mac receiver returned HTTP " + code);
+            }
+        } finally {
+            if (connection != null) connection.disconnect();
+        }
+    }
+
+    private void finishUploadFailure(
+            String message,
+            String name,
+            byte[] jpeg,
+            Exception error
+    ) {
+        android.util.Log.e(TAG, "Upload failed", error);
+        if (savePendingPhoto(name, jpeg)) {
+            done(message + "\n写真は眼鏡に保存しました");
+        } else {
+            done(message + "\nこの写真は保存されていません");
+        }
+    }
+
+    private boolean savePendingPhoto(String name, byte[] jpeg) {
+        try {
+            File pendingDirectory = new File(getFilesDir(), "pending");
+            if (!pendingDirectory.exists() && !pendingDirectory.mkdirs()) {
+                throw new IOException("Could not create pending photo directory");
+            }
+            File destination = uniqueFile(pendingDirectory, name);
+            File temporary = new File(pendingDirectory, destination.getName() + ".part");
+            try (FileOutputStream out = new FileOutputStream(temporary)) {
+                out.write(jpeg);
+            }
+            if (!temporary.renameTo(destination)) {
+                temporary.delete();
+                throw new IOException("Could not finalize pending photo");
+            }
+            android.util.Log.i(TAG, "Saved pending photo " + destination.getName());
+            return true;
+        } catch (Exception error) {
+            android.util.Log.e(TAG, "Could not save pending photo", error);
+            return false;
+        }
+    }
+
+    private int sendPendingPhotos(String uploadUrl, String token) {
+        File pendingDirectory = new File(getFilesDir(), "pending");
+        File[] pending = pendingDirectory.listFiles(
+                (directory, filename) -> filename.endsWith(".jpg")
+        );
+        if (pending == null || pending.length == 0) return 0;
+        Arrays.sort(pending, Comparator.comparing(File::getName));
+        int sent = 0;
+        for (File photo : pending) {
+            try {
+                byte[] jpeg = java.nio.file.Files.readAllBytes(photo.toPath());
+                sendPhoto(uploadUrl, photo.getName(), jpeg, token);
+                if (!photo.delete()) {
+                    android.util.Log.w(TAG, "Could not remove sent pending photo " + photo.getName());
+                    break;
+                }
+                sent++;
+            } catch (Exception error) {
+                android.util.Log.e(TAG, "Could not resend pending photo " + photo.getName(), error);
+                break;
+            }
+        }
+        return sent;
+    }
+
+    private boolean hasPendingPhotos() {
+        File pendingDirectory = new File(getFilesDir(), "pending");
+        File[] pending = pendingDirectory.listFiles(
+                (directory, filename) -> filename.endsWith(".jpg")
+        );
+        return pending != null && pending.length > 0;
+    }
+
+    private static File uniqueFile(File directory, String name) {
+        File destination = new File(directory, name);
+        String stem = name.endsWith(".jpg") ? name.substring(0, name.length() - 4) : name;
+        int counter = 2;
+        while (destination.exists()) {
+            destination = new File(directory, stem + "-" + counter + ".jpg");
+            counter++;
+        }
+        return destination;
     }
 
     /** Finds the receiver on the current Wi-Fi without storing its IP address. */
@@ -351,6 +521,14 @@ public final class MainActivity extends Activity {
                 for (InterfaceAddress interfaceAddress : networkInterface.getInterfaceAddresses()) {
                     InetAddress local = interfaceAddress.getAddress();
                     if (!(local instanceof Inet4Address)) continue;
+                    if (interfaceAddress.getNetworkPrefixLength() < 24) {
+                        android.util.Log.i(
+                                TAG,
+                                "Skipping /24 fallback on wider network prefix /"
+                                        + interfaceAddress.getNetworkPrefixLength()
+                        );
+                        continue;
+                    }
                     byte[] candidate = local.getAddress().clone();
                     for (int host = 1; host <= 254; host++) {
                         candidate[3] = (byte) host;
@@ -366,7 +544,13 @@ public final class MainActivity extends Activity {
 
             found = receiveDiscovery(socket, 3000, expectedProof);
             if (found != null) return found;
-            throw new IOException("Mac receiver was not found");
+            throw new ReceiverNotFoundException();
+        }
+    }
+
+    private static final class ReceiverNotFoundException extends IOException {
+        ReceiverNotFoundException() {
+            super("Mac receiver was not found");
         }
     }
 
@@ -473,27 +657,44 @@ public final class MainActivity extends Activity {
     private void setStatus(String message) { runOnUiThread(() -> status.setText(message)); }
 
     private void done(String message) {
-        closeCamera();
         runOnUiThread(() -> {
+            if (!busy && !awaitingImage) return;
+            watchdog.removeCallbacks(captureTimeout);
+            awaitingImage = false;
+            closeCameraOnMainThread();
             status.setText(message);
             busy = false;
+            stopCameraThread();
         });
-        if (cameraThread != null) {
-            cameraThread.quitSafely();
-            cameraThread = null;
-        }
     }
 
     private void closeCamera() {
+        runOnUiThread(this::closeCameraOnMainThread);
+    }
+
+    private void closeCameraOnMainThread() {
         if (captureSession != null) { captureSession.close(); captureSession = null; }
         if (openCamera != null) { openCamera.close(); openCamera = null; }
         if (imageReader != null) { imageReader.close(); imageReader = null; }
         if (previewSurface != null) { previewSurface.release(); previewSurface = null; }
+        if (previewTexture != null) { previewTexture.release(); previewTexture = null; }
+    }
+
+    private void stopCameraThread() {
+        if (cameraThread != null) {
+            cameraThread.quitSafely();
+            cameraThread = null;
+            cameraHandler = null;
+        }
     }
 
     @Override protected void onDestroy() {
+        watchdog.removeCallbacks(captureTimeout);
+        awaitingImage = false;
+        busy = false;
+        closeCameraOnMainThread();
         network.shutdownNow();
-        if (cameraThread != null) cameraThread.quitSafely();
+        stopCameraThread();
         super.onDestroy();
     }
 }
