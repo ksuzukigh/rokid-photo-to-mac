@@ -41,6 +41,9 @@ import java.net.NetworkInterface;
 import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.security.MessageDigest;
+import java.security.SecureRandom;
 import java.text.SimpleDateFormat;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -52,13 +55,18 @@ import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+
 /** A deliberately small proof of concept: one tap captures a JPEG and POSTs it to the Mac. */
 public final class MainActivity extends Activity {
     private static final String TAG = "RokidPhotoBridge";
     private static final int DISCOVERY_PORT = 8766;
-    private static final byte[] DISCOVERY_REQUEST =
-            "ROKID_PHOTO_BRIDGE_DISCOVER 1".getBytes(StandardCharsets.US_ASCII);
+    private static final String PREFERENCES = "bridge";
+    private static final String TOKEN_KEY = "token";
+    private static final String DISCOVERY_REQUEST_PREFIX = "ROKID_PHOTO_BRIDGE_DISCOVER 2 ";
     private static final int CAMERA_PERMISSION = 10;
+    private static final SecureRandom RANDOM = new SecureRandom();
 
     private TextView status;
     private HandlerThread cameraThread;
@@ -73,9 +81,21 @@ public final class MainActivity extends Activity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        saveSetupToken();
         makeUi();
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.CAMERA}, CAMERA_PERMISSION);
+        }
+    }
+
+    private void saveSetupToken() {
+        String setupToken = getIntent().getStringExtra("setup_token");
+        if (setupToken != null && setupToken.matches("[0-9a-f]{32}")) {
+            getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+                    .edit()
+                    .putString(TOKEN_KEY, setupToken)
+                    .apply();
+            android.util.Log.i(TAG, "Pairing token saved");
         }
     }
 
@@ -254,7 +274,13 @@ public final class MainActivity extends Activity {
         network.execute(() -> {
             HttpURLConnection connection = null;
             try {
-                String uploadUrl = discoverUploadUrl();
+                String token = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+                        .getString(TOKEN_KEY, "");
+                if (!token.matches("[0-9a-f]{32}")) {
+                    done("初期設定が必要です\nMacから入れ直してください");
+                    return;
+                }
+                String uploadUrl = discoverUploadUrl(token);
                 String name = "rokid-" + new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date()) + ".jpg";
                 connection = (HttpURLConnection) new URL(uploadUrl + "?filename=" + name).openConnection();
                 connection.setConnectTimeout(5000);
@@ -263,6 +289,7 @@ public final class MainActivity extends Activity {
                 connection.setDoOutput(true);
                 connection.setFixedLengthStreamingMode(jpeg.length);
                 connection.setRequestProperty("Content-Type", "image/jpeg");
+                connection.setRequestProperty("X-Photo-Token", token);
                 try (OutputStream out = connection.getOutputStream()) { out.write(jpeg); }
                 int code = connection.getResponseCode();
                 done(code >= 200 && code < 300 ? "3/3\n✓ Macに保存しました\nタップでもう一枚" : "Macが受け取りませんでした (" + code + ")");
@@ -276,23 +303,42 @@ public final class MainActivity extends Activity {
     }
 
     /** Finds the receiver on the current Wi-Fi without storing its IP address. */
-    private String discoverUploadUrl() throws IOException {
+    private String discoverUploadUrl(String token) throws IOException {
+        byte[] nonce = new byte[16];
+        RANDOM.nextBytes(nonce);
+        String nonceHex = toHex(nonce);
+        byte[] discoveryRequest =
+                (DISCOVERY_REQUEST_PREFIX + nonceHex).getBytes(StandardCharsets.US_ASCII);
+        byte[] expectedProof;
+        try {
+            expectedProof = hmacSha256(token, nonceHex);
+        } catch (GeneralSecurityException error) {
+            throw new IOException("Could not authenticate receiver discovery", error);
+        }
+
         try (DatagramSocket socket = new DatagramSocket()) {
             socket.setBroadcast(true);
 
             Set<String> destinations = new HashSet<>();
-            sendDiscoveryBestEffort(socket, InetAddress.getByName("255.255.255.255"), destinations);
+            sendDiscoveryBestEffort(
+                    socket,
+                    InetAddress.getByName("255.255.255.255"),
+                    destinations,
+                    discoveryRequest
+            );
             Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
             while (interfaces != null && interfaces.hasMoreElements()) {
                 NetworkInterface networkInterface = interfaces.nextElement();
                 if (!networkInterface.isUp() || networkInterface.isLoopback()) continue;
                 for (InterfaceAddress address : networkInterface.getInterfaceAddresses()) {
                     InetAddress broadcast = address.getBroadcast();
-                    if (broadcast != null) sendDiscoveryBestEffort(socket, broadcast, destinations);
+                    if (broadcast != null) {
+                        sendDiscoveryBestEffort(socket, broadcast, destinations, discoveryRequest);
+                    }
                 }
             }
 
-            String found = receiveDiscovery(socket, 700);
+            String found = receiveDiscovery(socket, 700, expectedProof);
             if (found != null) return found;
             android.util.Log.i(TAG, "Broadcast discovery timed out; probing local network");
 
@@ -308,52 +354,120 @@ public final class MainActivity extends Activity {
                     byte[] candidate = local.getAddress().clone();
                     for (int host = 1; host <= 254; host++) {
                         candidate[3] = (byte) host;
-                        sendDiscoveryBestEffort(socket, InetAddress.getByAddress(candidate), destinations);
+                        sendDiscoveryBestEffort(
+                                socket,
+                                InetAddress.getByAddress(candidate),
+                                destinations,
+                                discoveryRequest
+                        );
                     }
                 }
             }
 
-            found = receiveDiscovery(socket, 3000);
+            found = receiveDiscovery(socket, 3000, expectedProof);
             if (found != null) return found;
             throw new IOException("Mac receiver was not found");
         }
     }
 
-    private String receiveDiscovery(DatagramSocket socket, int timeoutMs) throws IOException {
-        socket.setSoTimeout(timeoutMs);
-        try {
-            byte[] responseBytes = new byte[128];
-            DatagramPacket response = new DatagramPacket(responseBytes, responseBytes.length);
-            socket.receive(response);
-            String message = new String(response.getData(), response.getOffset(), response.getLength(), StandardCharsets.US_ASCII);
-            String[] fields = message.trim().split(" ");
-            if (fields.length != 3 || !"ROKID_PHOTO_BRIDGE".equals(fields[0]) || !"1".equals(fields[1])) {
-                throw new IOException("Unknown receiver response");
+    private String receiveDiscovery(
+            DatagramSocket socket,
+            int timeoutMs,
+            byte[] expectedProof
+    ) throws IOException {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (true) {
+            int remaining = (int) (deadline - System.currentTimeMillis());
+            if (remaining <= 0) return null;
+            socket.setSoTimeout(remaining);
+            try {
+                byte[] responseBytes = new byte[256];
+                DatagramPacket response = new DatagramPacket(responseBytes, responseBytes.length);
+                socket.receive(response);
+                String message = new String(
+                        response.getData(),
+                        response.getOffset(),
+                        response.getLength(),
+                        StandardCharsets.US_ASCII
+                );
+                String[] fields = message.trim().split(" ");
+                if (
+                        fields.length != 4
+                        || !"ROKID_PHOTO_BRIDGE".equals(fields[0])
+                        || !"2".equals(fields[1])
+                ) {
+                    continue;
+                }
+                int port;
+                byte[] suppliedProof;
+                try {
+                    port = Integer.parseInt(fields[2]);
+                    suppliedProof = fromHex(fields[3]);
+                } catch (IllegalArgumentException error) {
+                    continue;
+                }
+                if (
+                        port < 1
+                        || port > 65535
+                        || !MessageDigest.isEqual(expectedProof, suppliedProof)
+                ) {
+                    continue;
+                }
+                String uploadUrl =
+                        "http://" + response.getAddress().getHostAddress() + ":" + port + "/upload";
+                android.util.Log.i(TAG, "Authenticated receiver found at " + uploadUrl);
+                return uploadUrl;
+            } catch (SocketTimeoutException timeout) {
+                return null;
             }
-            int port = Integer.parseInt(fields[2]);
-            if (port < 1 || port > 65535) throw new IOException("Invalid receiver port");
-            String uploadUrl = "http://" + response.getAddress().getHostAddress() + ":" + port + "/upload";
-            android.util.Log.i(TAG, "Receiver found at " + uploadUrl);
-            return uploadUrl;
-        } catch (SocketTimeoutException timeout) {
-            return null;
-        } catch (NumberFormatException error) {
-            throw new IOException("Invalid receiver response", error);
         }
     }
 
-    private void sendDiscoveryBestEffort(DatagramSocket socket, InetAddress address, Set<String> destinations) {
+    private void sendDiscoveryBestEffort(
+            DatagramSocket socket,
+            InetAddress address,
+            Set<String> destinations,
+            byte[] requestBytes
+    ) {
         try {
-            sendDiscovery(socket, address, destinations);
+            sendDiscovery(socket, address, destinations, requestBytes);
         } catch (IOException ignored) {
             // Continue with the other local addresses.
         }
     }
 
-    private void sendDiscovery(DatagramSocket socket, InetAddress address, Set<String> destinations) throws IOException {
+    private void sendDiscovery(
+            DatagramSocket socket,
+            InetAddress address,
+            Set<String> destinations,
+            byte[] requestBytes
+    ) throws IOException {
         if (!destinations.add(address.getHostAddress())) return;
-        DatagramPacket request = new DatagramPacket(DISCOVERY_REQUEST, DISCOVERY_REQUEST.length, address, DISCOVERY_PORT);
+        DatagramPacket request =
+                new DatagramPacket(requestBytes, requestBytes.length, address, DISCOVERY_PORT);
         socket.send(request);
+    }
+
+    private static byte[] hmacSha256(String token, String nonce)
+            throws GeneralSecurityException {
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(token.getBytes(StandardCharsets.US_ASCII), "HmacSHA256"));
+        return mac.doFinal(nonce.getBytes(StandardCharsets.US_ASCII));
+    }
+
+    private static String toHex(byte[] bytes) {
+        StringBuilder result = new StringBuilder(bytes.length * 2);
+        for (byte value : bytes) result.append(String.format(Locale.US, "%02x", value & 0xff));
+        return result.toString();
+    }
+
+    private static byte[] fromHex(String value) {
+        if (!value.matches("[0-9a-f]{64}")) throw new IllegalArgumentException("Invalid proof");
+        byte[] result = new byte[value.length() / 2];
+        for (int index = 0; index < value.length(); index += 2) {
+            result[index / 2] = (byte) Integer.parseInt(value.substring(index, index + 2), 16);
+        }
+        return result;
     }
 
     private void setStatus(String message) { runOnUiThread(() -> status.setText(message)); }

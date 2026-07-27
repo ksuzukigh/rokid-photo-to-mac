@@ -1,10 +1,13 @@
 #!/bin/bash
 
 set -e
+set -o pipefail
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:$PATH"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APK="$SCRIPT_DIR/Photo-to-Mac.apk"
+TOKEN_FILE="$HOME/Library/Application Support/Rokid Photo Bridge/token.txt"
+PACKAGE="io.github.ksuzukigh.phototomac"
 
 pause_and_exit() {
     echo
@@ -14,6 +17,19 @@ pause_and_exit() {
 
 if [ ! -f "$APK" ]; then
     echo "Photo-to-Mac.apkが見つかりません。ダウンロードしたフォルダを確認してください。"
+    pause_and_exit
+fi
+
+if [ ! -f "$TOKEN_FILE" ]; then
+    echo "MacとRokidを安全に組み合わせる合言葉がまだありません。"
+    echo "先に『Mac受信機を設定.command』を実行してください。"
+    pause_and_exit
+fi
+
+TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")"
+if ! printf '%s' "$TOKEN" | grep -Eq '^[0-9a-f]{32}$'; then
+    echo "Mac側の合言葉を確認できませんでした。"
+    echo "『Mac受信機を設定.command』をもう一度実行してください。"
     pause_and_exit
 fi
 
@@ -50,7 +66,25 @@ if [ -z "$SERIAL" ]; then
 fi
 
 echo "Photo to MacをRokidへ入れています..."
-adb -s "$SERIAL" install -r "$APK"
+INSTALL_LOG="$(mktemp)"
+if ! adb -s "$SERIAL" install -r "$APK" 2>&1 | tee "$INSTALL_LOG"; then
+    if grep -q "INSTALL_FAILED_UPDATE_INCOMPATIBLE" "$INSTALL_LOG"; then
+        echo "以前の開発版と署名が異なるため、いったん削除して正式版を入れ直します。"
+        adb -s "$SERIAL" uninstall "$PACKAGE" >/dev/null 2>&1 || true
+        adb -s "$SERIAL" install "$APK"
+    else
+        rm -f "$INSTALL_LOG"
+        echo "インストールに失敗しました。表示された内容をご確認ください。"
+        pause_and_exit
+    fi
+fi
+rm -f "$INSTALL_LOG"
+
+adb -s "$SERIAL" shell am force-stop "$PACKAGE" >/dev/null
+adb -s "$SERIAL" shell am start \
+    -n "$PACKAGE/.MainActivity" \
+    --es setup_token "$TOKEN" >/dev/null
+echo "MacとRokidの合言葉を設定しました。"
 
 echo
 echo "インストールが完了しました。"

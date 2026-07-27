@@ -34,7 +34,7 @@ GitHub画面上部の緑色の「Code」ボタンを押し、「Download ZIP」�
 
 Terminalに「Macの写真受信機を設定しました」と表示されたら、Enterキーを押して処理を終了します。
 
-設定後はMacへログインするたびに受信機が自動で動きます。
+設定時に、このMacとRokidだけが写真をやり取りするための合言葉が自動で作られます。設定後はMacへログインするたびに受信機が自動で動きます。
 
 ### 3. Rokidへアプリを入れる
 
@@ -43,9 +43,11 @@ Terminalに「Macの写真受信機を設定しました」と表示されたら
 3. RokidにUSB接続の確認が出た場合は許可します。
 4. 「インストールが完了しました」と表示されたら準備完了です。
 
-### macOSに止められたとき（2つのファイルに共通）
+この操作でアプリのインストールと同時に、Mac側で作った合言葉がRokidへ安全に渡されます。以前の版を使用していた場合も、`Mac受信機を設定.command`と`Rokidへアプリを入れる.command`をこの順でもう一度実行してください。
 
-ダウンロードした2つの`.command`ファイルは、**それぞれ初回に1回ずつ**macOSの許可が必要になる場合があります。
+### macOSに止められたとき（3つのファイルに共通）
+
+ダウンロードした3つの`.command`ファイルは、**それぞれ初回に1回ずつ**macOSの許可が必要になる場合があります。
 
 「Appleは、Macに損害を与えたり、プライバシーを侵害する可能性のあるマルウェアが含まれていないことを検証できませんでした」と表示されたら、次の手順で、そのとき開こうとしたファイルを許可します。
 
@@ -55,7 +57,7 @@ Terminalに「Macの写真受信機を設定しました」と表示されたら
 4. 「セキュリティ」に表示されたファイルの「開く」を押します。
 5. 確認画面で「このまま開く」を押し、Macのログインパスワードを入力します。
 
-まず`Mac受信機を設定.command`でこの操作を行い、次に`Rokidへアプリを入れる.command`でも警告が出た場合は、同じ操作をもう一度行います。
+まず`Mac受信機を設定.command`でこの操作を行い、次に`Rokidへアプリを入れる.command`でも警告が出た場合は、同じ操作をもう一度行います。`Mac受信機を停止.command`を初めて使うときも同様です。
 
 許可ボタンは、ファイルを開こうとしてから約1時間表示されます。詳しくは[Apple公式の説明](https://support.apple.com/ja-jp/guide/mac-help/mh40617/mac)を参照してください。
 
@@ -69,6 +71,12 @@ Terminalに「Macの写真受信機を設定しました」と表示されたら
 4. 「Macに保存しました」と表示されたら、Macの「ピクチャ」→「Rokid Inbox」を開きます。
 
 普段は開発用ケーブルをつなぐ必要はありません。
+
+### 写真の受信を止める
+
+外出先などで写真の受信機を動かしたくないときは、`Mac受信機を停止.command`をダブルクリックします。受信機の自動起動も停止しますが、「ピクチャ」→「Rokid Inbox」に保存済みの写真は削除されません。
+
+もう一度使うときは、`Mac受信機を設定.command`を実行してください。以前と同じ合言葉を引き続き使うため、Rokidへアプリを入れ直す必要はありません。
 
 ### 初めて写真を送るときのMac側の許可
 
@@ -108,7 +116,9 @@ Macから操作する別のツールがなくても、Rokid単体でWi-Fiを戻�
 
 ## 安全上の注意
 
-写真の受信機にはパスワードがありません。自宅など、信頼できるWi-Fiの中だけで使用してください。
+MacとRokidは、初回設定時に作る専用の合言葉で互いを確認します。合言葉が一致しない機器からの写真は受け取らず、合言葉を証明できないMacへ写真を送りません。
+
+写真は同じWi-Fi内を暗号化されていないHTTPで転送します。通信内容を保護するため、自宅など信頼できるWi-Fiの中で使用し、外出先では`Mac受信機を停止.command`で停止してください。
 
 ## 対応状況
 
@@ -124,10 +134,17 @@ JDK 17、Android SDK、ADBが必要です。
 ```bash
 export JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home
 export ANDROID_SDK_ROOT=/opt/homebrew/share/android-commandlinetools
-./gradlew assembleDebug
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+keytool -genkeypair -v -keystore ~/rokid-release.jks -alias rokid \
+  -keyalg RSA -keysize 2048 -validity 10000
+
+export ROKID_STORE_PASSWORD='配布用の鍵を作ったときのパスワード'
+export ROKID_KEY_PASSWORD="$ROKID_STORE_PASSWORD"
+./gradlew assembleRelease
+cp app/build/outputs/apk/release/app-release.apk Photo-to-Mac.apk
 ```
 
-アプリはUDP 8766番ポートでMacの受信機を探し、写真をTCP 8765番ポートへ送ります。固定IPアドレスは保存しません。
+`rokid-release.jks`とパスワードはリポジトリへ追加せず、安全な場所へバックアップしてください。どちらかを失うと、同じ署名の更新版を配布できなくなります。
+
+アプリはUDP 8766番ポートで合言葉が一致するMacの受信機を探し、写真をTCP 8765番ポートへ送ります。固定IPアドレスは保存しません。
 
 </details>
