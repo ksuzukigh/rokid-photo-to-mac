@@ -15,8 +15,8 @@ android {
         applicationId 'io.github.ksuzukigh.phototomac'
         minSdk 32
         targetSdk 32
-        versionCode 3
-        versionName '0.3'
+        versionCode 4
+        versionName '0.4'
     }
 
     signingConfigs {
@@ -38,5 +38,7 @@ android {
     lint {
         // Photo to Mac is sideloaded onto the RV101, not distributed through Google Play.
         disable 'ExpiredTargetSdkVersion'
+        // The RV101 app requires its built-in camera and is not a ChromeOS app.
+        disable 'PermissionImpliesUnsupportedChromeOsHardware'
     }
 }

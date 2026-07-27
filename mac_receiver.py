@@ -6,7 +6,7 @@ import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import BaseRequestHandler, ThreadingUDPServer
-from threading import Thread
+from threading import Lock, Thread
 from urllib.parse import parse_qs, urlparse
 
 INBOX = Path.home() / "Pictures" / "Rokid Inbox"
@@ -22,6 +22,7 @@ TOKEN = TOKEN_PATH.read_text(encoding="ascii").strip() if TOKEN_PATH.exists() el
 if len(TOKEN) != 32 or any(character not in "0123456789abcdef" for character in TOKEN):
     TOKEN = ""
 DISCOVERY_PREFIX = b"ROKID_PHOTO_BRIDGE_DISCOVER 2"
+SAVE_LOCK = Lock()
 
 
 class Discovery(BaseRequestHandler):
@@ -48,6 +49,8 @@ class DiscoveryServer(ThreadingUDPServer):
 
 
 class Receiver(BaseHTTPRequestHandler):
+    timeout = 30
+
     def do_GET(self):
         if urlparse(self.path).path != "/health":
             self.send_error(404)
@@ -64,14 +67,20 @@ class Receiver(BaseHTTPRequestHandler):
         if not TOKEN or not hmac.compare_digest(supplied_token, TOKEN):
             self.send_error(403, "Not paired")
             return
-        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.send_error(400, "Bad Content-Length")
+            return
         if not 0 < length <= MAX_BYTES:
             self.send_error(413, "Photo is empty or too large")
             return
         body = self.rfile.read(length)
+        if len(body) != length:
+            self.send_error(400, "Upload was interrupted")
+            return
         if (
-            len(body) != length
-            or self.headers.get_content_type() != "image/jpeg"
+            self.headers.get_content_type() != "image/jpeg"
             or not body.startswith(b"\xff\xd8")
             or not body.endswith(b"\xff\xd9")
         ):
@@ -82,8 +91,20 @@ class Receiver(BaseHTTPRequestHandler):
         if not safe_name:
             safe_name = "rokid-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".jpg"
         INBOX.mkdir(parents=True, exist_ok=True)
-        destination = INBOX / safe_name
-        destination.write_bytes(body)
+        with SAVE_LOCK:
+            destination = INBOX / safe_name
+            stem, suffix = destination.stem, destination.suffix
+            counter = 2
+            while destination.exists():
+                destination = INBOX / f"{stem}-{counter}{suffix}"
+                counter += 1
+            temporary = INBOX / (destination.name + ".part")
+            try:
+                temporary.write_bytes(body)
+                temporary.replace(destination)
+            except Exception:
+                temporary.unlink(missing_ok=True)
+                raise
         print(f"Saved {destination}", flush=True)
         self.send_response(201)
         self.end_headers()
