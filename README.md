@@ -1,8 +1,8 @@
-# Photo to Mac for Rokid AI Glasses
+# Photo to Mac
 
 <p align="center"><img src="artwork/app-icon.png" width="180" alt="Photo to Macのアイコン"></p>
 
-Rokid AI Glassesで見ている景色を撮影し、その写真をMacへ直接送るアプリです。
+Rokid AI Glasses RV101で見ている景色を撮影し、その写真をMacへ直接送るアプリです。
 
 スマートフォンやクラウドサービスは使いません。RokidとMacが同じWi-Fiにつながっていれば、撮った写真がMacの「ピクチャ」フォルダへ入ります。
 
@@ -118,9 +118,9 @@ Macから操作する別のツールがなくても、Rokid単体でWi-Fiを戻�
 
 まだ一度も使ったことがないWi-Fiへ接続する場合は、先にRokid本体のWi-Fi設定でネットワーク名とパスワードを登録してください。
 
-なお、別公開の[Mac操作ツール](https://github.com/ksuzukigh/rokid-mac-control)を使用中は、Wi-Fiがオフになったときの自動復旧も利用できます。ただし、この写真転送アプリだけでも上記の手順で使用できます。
+なお、別公開のMac操作アプリ[Rokid Control](https://github.com/ksuzukigh/rokid-mac-control)を使用中は、Wi-Fiがオフになったときの自動復旧も利用できます。ただし、「Photo to Mac」だけでも上記の手順で使用できます。
 
-より簡単に、アプリを開くだけでWi-Fiを戻したい場合は、別公開の[Wi-Fi ON](https://github.com/ksuzukigh/rokid-wifi-on)を利用できます。Wi-Fi ONを入れなくても、Photo to Mac自身の「設定画面＋テンプル1回」の復旧機能はそのまま使えます。
+より簡単に、アプリを開くだけでWi-Fiを戻したい場合は、別公開の[Wi-Fi ON](https://github.com/ksuzukigh/rokid-wifi-on)を利用できます。「Wi-Fi ON」を入れなくても、「Photo to Mac」自身の「設定画面＋テンプル1回」の復旧機能はそのまま使えます。
 
 ## 送れないとき
 
@@ -177,6 +177,11 @@ cp app/build/outputs/apk/release/app-release.apk Photo-to-Mac.apk
 ブロードキャストで受信機が見つからない場合は、同じ`/24`ネットワーク内の最大254アドレスへ認証付きの問い合わせを送ります。会社など、これより広いネットワークでは予備探索を行いません。ネットワーク管理下の環境で使用する場合は、この探索方式を管理者へ確認してください。
 
 </details>
+
+## 関連アプリ
+
+- [Wi-Fi ON](https://github.com/ksuzukigh/rokid-wifi-on)：Rokid AI Glasses RV101のWi-Fiを復旧します。
+- [Rokid Control](https://github.com/ksuzukigh/rokid-mac-control)：Rokid AI Glasses RV101の画面をMacに表示し、Macから操作します。
 
 ## 更新履歴
 
