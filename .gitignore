@@ -9,3 +9,5 @@ local.properties
 !Photo-to-Mac.apk
 icon-concepts/
 *.plist
+*.jks
+*.keystore

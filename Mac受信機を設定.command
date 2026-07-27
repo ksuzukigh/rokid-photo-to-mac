@@ -27,6 +27,11 @@ if [ -z "$PYTHON_PATH" ]; then
 fi
 
 mkdir -p "$RUNTIME_DIR" "$LAUNCH_AGENTS_DIR" "$HOME/Pictures/Rokid Inbox"
+TOKEN_FILE="$RUNTIME_DIR/token.txt"
+if [ ! -f "$TOKEN_FILE" ]; then
+    (umask 077; openssl rand -hex 16 > "$TOKEN_FILE")
+fi
+chmod 600 "$TOKEN_FILE"
 cp "$SCRIPT_DIR/mac_receiver.py" "$RUNTIME_DIR/mac_receiver.py"
 
 "$PYTHON_PATH" - "$PLIST" "$PYTHON_PATH" "$RUNTIME_DIR/mac_receiver.py" "$RUNTIME_DIR" "$LOG_OUT" "$LOG_ERR" <<'PY'
@@ -55,4 +60,5 @@ launchctl bootstrap "gui/$USER_ID" "$PLIST"
 
 echo "Macの写真受信機を設定しました。"
 echo "受信した写真は『ピクチャ/Rokid Inbox』へ保存されます。"
+echo "使わないときは『Mac受信機を停止.command』で停止できます。"
 read -r -p "Enterキーで処理を終了します..."
