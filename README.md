@@ -151,10 +151,6 @@ MacとRokidは、初回設定時に作る専用の合言葉で互いを確認し
 
 やむを得ず公衆Wi-Fiで使ってしまった場合は、合言葉を作り直すことをおすすめします。`~/Library/Application Support/Rokid Photo Bridge/token.txt`を削除したあと、`Mac受信機を設定.command`と`Rokidへアプリを入れる.command`をこの順で実行してください。
 
-## 対応状況
-
-Rokid AI Glasses RV101の実機で、撮影・Macへの転送・Wi-Fi復帰・アイコン表示を確認しています。他のRokid製品での動作は未確認です。
-
 <details>
 <summary>開発者向け情報</summary>
 
