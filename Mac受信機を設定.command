@@ -55,7 +55,7 @@ if ! find_working_python; then
     if [ -z "$PYTHON_PATH" ]; then
         echo "写真受信に使えるPythonが見つかりませんでした。"
         echo "https://brew.sh/ja/ を開いてHomebrewをインストールしてください。"
-        read -r -p "Enterキーで処理を終了します..."
+        read -r -p "Enterキーで処理を終了します..." || true
         exit 1
     fi
 fi
@@ -63,7 +63,7 @@ fi
 if [ ! -f "$SCRIPT_DIR/mac_receiver.py" ]; then
     echo "mac_receiver.pyが見つかりません。"
     echo "ダウンロードしたフォルダ内のファイルを移動せず、もう一度実行してください。"
-    read -r -p "Enterキーで処理を終了します..."
+    read -r -p "Enterキーで処理を終了します..." || true
     exit 1
 fi
 

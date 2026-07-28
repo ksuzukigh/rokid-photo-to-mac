@@ -5,6 +5,7 @@ import hashlib
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import socket as socket_module
 from socketserver import BaseRequestHandler, ThreadingUDPServer
 from threading import Lock, Thread
 from urllib.parse import parse_qs, urlparse
@@ -21,8 +22,19 @@ TOKEN_PATH = (
 TOKEN = TOKEN_PATH.read_text(encoding="ascii").strip() if TOKEN_PATH.exists() else ""
 if len(TOKEN) != 32 or any(character not in "0123456789abcdef" for character in TOKEN):
     TOKEN = ""
-DISCOVERY_PREFIX = b"ROKID_PHOTO_BRIDGE_DISCOVER 2"
+PHOTO_PORT = 8765
+DISCOVERY_PREFIX = b"ROKID_PHOTO_BRIDGE_DISCOVER 3"
 SAVE_LOCK = Lock()
+
+
+def local_address_for(peer_ip):
+    """Return the Mac address used to reach this peer."""
+    probe = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_DGRAM)
+    try:
+        probe.connect((peer_ip, 9))
+        return probe.getsockname()[0]
+    finally:
+        probe.close()
 
 
 class Discovery(BaseRequestHandler):
@@ -37,8 +49,16 @@ class Discovery(BaseRequestHandler):
             or not TOKEN
         ):
             return
-        proof = hmac.new(TOKEN.encode("ascii"), fields[2], hashlib.sha256).hexdigest()
-        response = f"ROKID_PHOTO_BRIDGE 2 8765 {proof}".encode("ascii")
+        try:
+            address = local_address_for(self.client_address[0])
+        except OSError:
+            return
+        nonce = fields[2].decode("ascii")
+        signed = f"{nonce} {address} {PHOTO_PORT}".encode("ascii")
+        proof = hmac.new(TOKEN.encode("ascii"), signed, hashlib.sha256).hexdigest()
+        response = (
+            f"ROKID_PHOTO_BRIDGE 3 {address} {PHOTO_PORT} {proof}"
+        ).encode("ascii")
         print(f"Authenticated discovery from {self.client_address[0]}", flush=True)
         socket.sendto(response, self.client_address)
 
@@ -51,20 +71,25 @@ class DiscoveryServer(ThreadingUDPServer):
 class Receiver(BaseHTTPRequestHandler):
     timeout = 30
 
-    def do_GET(self):
-        if urlparse(self.path).path != "/health":
-            self.send_error(404)
-            return
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"ready\n")
-
     def do_POST(self):
         if urlparse(self.path).path != "/upload":
             self.send_error(404)
             return
-        supplied_token = self.headers.get("X-Photo-Token", "")
-        if not TOKEN or not hmac.compare_digest(supplied_token, TOKEN):
+        nonce = self.headers.get("X-Photo-Nonce", "")
+        supplied_proof = self.headers.get("X-Photo-Proof", "")
+        if (
+            not TOKEN
+            or len(nonce) != 32
+            or any(character not in "0123456789abcdef" for character in nonce)
+        ):
+            self.send_error(403, "Not paired")
+            return
+        expected_proof = hmac.new(
+            TOKEN.encode("ascii"),
+            f"{nonce} upload".encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(supplied_proof, expected_proof):
             self.send_error(403, "Not paired")
             return
         try:
@@ -88,7 +113,7 @@ class Receiver(BaseHTTPRequestHandler):
             return
         supplied = parse_qs(urlparse(self.path).query).get("filename", [""])[0]
         safe_name = Path(supplied).name if supplied.endswith(".jpg") else ""
-        if not safe_name:
+        if not safe_name or safe_name.startswith("."):
             safe_name = "rokid-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".jpg"
         INBOX.mkdir(parents=True, exist_ok=True)
         with SAVE_LOCK:
@@ -122,4 +147,4 @@ if __name__ == "__main__":
     Thread(target=discovery.serve_forever, daemon=True).start()
     print("Receiver discovery is ready on UDP port 8766")
     print(f"Waiting for Rokid photos in {INBOX}")
-    ThreadingHTTPServer(("0.0.0.0", 8765), Receiver).serve_forever()
+    ThreadingHTTPServer(("0.0.0.0", PHOTO_PORT), Receiver).serve_forever()

@@ -35,16 +35,20 @@ import android.widget.Toast;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
-import java.net.HttpURLConnection;
 import java.net.InetAddress;
 import java.net.Inet4Address;
+import java.net.InetSocketAddress;
 import java.net.InterfaceAddress;
 import java.net.NetworkInterface;
+import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.URL;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
@@ -69,8 +73,10 @@ public final class MainActivity extends Activity {
     private static final int DISCOVERY_PORT = 8766;
     private static final String PREFERENCES = "bridge";
     private static final String TOKEN_KEY = "token";
-    private static final String DISCOVERY_REQUEST_PREFIX = "ROKID_PHOTO_BRIDGE_DISCOVER 2 ";
+    private static final String DISCOVERY_REQUEST_PREFIX = "ROKID_PHOTO_BRIDGE_DISCOVER 3 ";
     private static final int CAMERA_PERMISSION = 10;
+    private static final int MAX_RESEND_PER_SESSION = 5;
+    private static final int MAX_PENDING_PHOTOS = 30;
     private static final SecureRandom RANDOM = new SecureRandom();
 
     private TextView status;
@@ -96,6 +102,9 @@ public final class MainActivity extends Activity {
         super.onCreate(state);
         saveSetupToken();
         makeUi();
+        cameraThread = new HandlerThread("rokid-camera");
+        cameraThread.start();
+        cameraHandler = new Handler(cameraThread.getLooper());
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.CAMERA}, CAMERA_PERMISSION);
         }
@@ -103,13 +112,16 @@ public final class MainActivity extends Activity {
 
     private void saveSetupToken() {
         String setupToken = getIntent().getStringExtra("setup_token");
-        if (setupToken != null && setupToken.matches("[0-9a-f]{32}")) {
-            getSharedPreferences(PREFERENCES, MODE_PRIVATE)
-                    .edit()
-                    .putString(TOKEN_KEY, setupToken)
-                    .apply();
-            android.util.Log.i(TAG, "Pairing token saved");
+        if (setupToken == null || !setupToken.matches("[0-9a-f]{32}")) return;
+        android.net.Uri referrer = getReferrer();
+        String source = referrer != null ? referrer.getHost() : null;
+        if (!"com.android.shell".equals(source)) {
+            android.util.Log.w(TAG, "Ignored a pairing token from " + source);
+            return;
         }
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+                .edit().putString(TOKEN_KEY, setupToken).apply();
+        android.util.Log.i(TAG, "Pairing token saved");
     }
 
     private void makeUi() {
@@ -193,9 +205,6 @@ public final class MainActivity extends Activity {
         watchdog.removeCallbacks(captureTimeout);
         watchdog.postDelayed(captureTimeout, 10000);
         setStatus("1/3\n撮影中…");
-        cameraThread = new HandlerThread("rokid-camera");
-        cameraThread.start();
-        cameraHandler = new Handler(cameraThread.getLooper());
         try {
             CameraManager manager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
             String cameraId = manager.getCameraIdList()[0];
@@ -369,26 +378,62 @@ public final class MainActivity extends Activity {
 
     private void sendPhoto(String uploadUrl, String name, byte[] jpeg, String token)
             throws IOException {
-        HttpURLConnection connection = null;
+        byte[] nonce = new byte[16];
+        RANDOM.nextBytes(nonce);
+        String nonceHex = toHex(nonce);
+        String proof;
         try {
-            connection = (HttpURLConnection) new URL(uploadUrl + "?filename=" + name).openConnection();
-            connection.setConnectTimeout(5000);
-            connection.setReadTimeout(10000);
-            connection.setRequestMethod("POST");
-            connection.setDoOutput(true);
-            connection.setFixedLengthStreamingMode(jpeg.length);
-            connection.setRequestProperty("Content-Type", "image/jpeg");
-            connection.setRequestProperty("X-Photo-Token", token);
-            try (OutputStream out = connection.getOutputStream()) {
-                out.write(jpeg);
+            proof = toHex(hmacSha256(token, nonceHex + " upload"));
+        } catch (GeneralSecurityException error) {
+            throw new IOException("Could not authenticate photo upload", error);
+        }
+
+        URL target = new URL(uploadUrl);
+        if (!"http".equals(target.getProtocol())) {
+            throw new IOException("Unsupported receiver protocol");
+        }
+        InetAddress address = InetAddress.getByName(target.getHost());
+        if (!isPrivateAddress(address)) {
+            throw new IOException("Receiver is outside the private network");
+        }
+        int port = target.getPort() >= 1 ? target.getPort() : 80;
+        String path = target.getPath()
+                + "?filename=" + URLEncoder.encode(name, StandardCharsets.UTF_8.name());
+        String host = target.getHost() + ":" + port;
+        String headers = "POST " + path + " HTTP/1.1\r\n"
+                + "Host: " + host + "\r\n"
+                + "Content-Type: image/jpeg\r\n"
+                + "X-Photo-Nonce: " + nonceHex + "\r\n"
+                + "X-Photo-Proof: " + proof + "\r\n"
+                + "Content-Length: " + jpeg.length + "\r\n"
+                + "Connection: close\r\n\r\n";
+
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress(address, port), 5000);
+            socket.setSoTimeout(10000);
+            OutputStream out = socket.getOutputStream();
+            out.write(headers.getBytes(StandardCharsets.US_ASCII));
+            out.write(jpeg);
+            out.flush();
+            String statusLine;
+            try (BufferedReader input = new BufferedReader(
+                    new InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII))) {
+                statusLine = input.readLine();
             }
-            int code = connection.getResponseCode();
+            if (statusLine == null || !statusLine.matches("HTTP/1\\.[01] [0-9]{3}.*")) {
+                throw new IOException("Mac receiver returned an invalid response");
+            }
+            int code = Integer.parseInt(statusLine.substring(9, 12));
             if (code < 200 || code >= 300) {
                 throw new IOException("Mac receiver returned HTTP " + code);
             }
-        } finally {
-            if (connection != null) connection.disconnect();
         }
+    }
+
+    private static boolean isPrivateAddress(InetAddress address) {
+        return address.isSiteLocalAddress()
+                || address.isLinkLocalAddress()
+                || address.isLoopbackAddress();
     }
 
     private void finishUploadFailure(
@@ -411,6 +456,7 @@ public final class MainActivity extends Activity {
             if (!pendingDirectory.exists() && !pendingDirectory.mkdirs()) {
                 throw new IOException("Could not create pending photo directory");
             }
+            trimPendingPhotos(pendingDirectory);
             File destination = uniqueFile(pendingDirectory, name);
             File temporary = new File(pendingDirectory, destination.getName() + ".part");
             try (FileOutputStream out = new FileOutputStream(temporary)) {
@@ -435,22 +481,51 @@ public final class MainActivity extends Activity {
         );
         if (pending == null || pending.length == 0) return 0;
         Arrays.sort(pending, Comparator.comparing(File::getName));
+        int planned = Math.min(pending.length, MAX_RESEND_PER_SESSION);
         int sent = 0;
         for (File photo : pending) {
+            if (sent >= MAX_RESEND_PER_SESSION) break;
+            setStatus("2/3\n未送信の写真を送信中…\n" + (sent + 1) + "/" + planned);
             try {
                 byte[] jpeg = java.nio.file.Files.readAllBytes(photo.toPath());
                 sendPhoto(uploadUrl, photo.getName(), jpeg, token);
+                sent++;
                 if (!photo.delete()) {
                     android.util.Log.w(TAG, "Could not remove sent pending photo " + photo.getName());
-                    break;
+                    File sentMarker = new File(
+                            photo.getParentFile(),
+                            photo.getName() + ".sent"
+                    );
+                    if (!photo.renameTo(sentMarker)) {
+                        android.util.Log.e(
+                                TAG,
+                                "Could not mark sent pending photo " + photo.getName()
+                        );
+                        break;
+                    }
                 }
-                sent++;
             } catch (Exception error) {
                 android.util.Log.e(TAG, "Could not resend pending photo " + photo.getName(), error);
                 break;
             }
         }
         return sent;
+    }
+
+    private void trimPendingPhotos(File pendingDirectory) {
+        File[] pending = pendingDirectory.listFiles(
+                (directory, filename) -> filename.endsWith(".jpg")
+        );
+        if (pending == null || pending.length < MAX_PENDING_PHOTOS) return;
+        Arrays.sort(pending, Comparator.comparing(File::getName));
+        for (int index = 0; index <= pending.length - MAX_PENDING_PHOTOS; index++) {
+            if (!pending[index].delete()) {
+                android.util.Log.w(
+                        TAG,
+                        "Could not trim pending photo " + pending[index].getName()
+                );
+            }
+        }
     }
 
     private boolean hasPendingPhotos() {
@@ -479,13 +554,6 @@ public final class MainActivity extends Activity {
         String nonceHex = toHex(nonce);
         byte[] discoveryRequest =
                 (DISCOVERY_REQUEST_PREFIX + nonceHex).getBytes(StandardCharsets.US_ASCII);
-        byte[] expectedProof;
-        try {
-            expectedProof = hmacSha256(token, nonceHex);
-        } catch (GeneralSecurityException error) {
-            throw new IOException("Could not authenticate receiver discovery", error);
-        }
-
         try (DatagramSocket socket = new DatagramSocket()) {
             socket.setBroadcast(true);
 
@@ -508,7 +576,7 @@ public final class MainActivity extends Activity {
                 }
             }
 
-            String found = receiveDiscovery(socket, 700, expectedProof);
+            String found = receiveDiscovery(socket, 700, token, nonceHex);
             if (found != null) return found;
             android.util.Log.i(TAG, "Broadcast discovery timed out; probing local network");
 
@@ -542,7 +610,7 @@ public final class MainActivity extends Activity {
                 }
             }
 
-            found = receiveDiscovery(socket, 3000, expectedProof);
+            found = receiveDiscovery(socket, 3000, token, nonceHex);
             if (found != null) return found;
             throw new ReceiverNotFoundException();
         }
@@ -557,7 +625,8 @@ public final class MainActivity extends Activity {
     private String receiveDiscovery(
             DatagramSocket socket,
             int timeoutMs,
-            byte[] expectedProof
+            String token,
+            String nonceHex
     ) throws IOException {
         long deadline = System.currentTimeMillis() + timeoutMs;
         while (true) {
@@ -576,29 +645,39 @@ public final class MainActivity extends Activity {
                 );
                 String[] fields = message.trim().split(" ");
                 if (
-                        fields.length != 4
+                        fields.length != 5
                         || !"ROKID_PHOTO_BRIDGE".equals(fields[0])
-                        || !"2".equals(fields[1])
+                        || !"3".equals(fields[1])
                 ) {
                     continue;
                 }
+                String address = fields[2];
+                if (!address.matches("[0-9]{1,3}(\\.[0-9]{1,3}){3}")) continue;
                 int port;
                 byte[] suppliedProof;
                 try {
-                    port = Integer.parseInt(fields[2]);
-                    suppliedProof = fromHex(fields[3]);
+                    port = Integer.parseInt(fields[3]);
+                    suppliedProof = fromHex(fields[4]);
                 } catch (IllegalArgumentException error) {
                     continue;
                 }
-                if (
-                        port < 1
-                        || port > 65535
-                        || !MessageDigest.isEqual(expectedProof, suppliedProof)
-                ) {
-                    continue;
+                if (port < 1 || port > 65535) continue;
+                byte[] expectedProof;
+                try {
+                    expectedProof = hmacSha256(
+                            token,
+                            nonceHex + " " + address + " " + port
+                    );
+                } catch (GeneralSecurityException error) {
+                    throw new IOException(
+                            "Could not authenticate receiver discovery",
+                            error
+                    );
                 }
-                String uploadUrl =
-                        "http://" + response.getAddress().getHostAddress() + ":" + port + "/upload";
+                if (!MessageDigest.isEqual(expectedProof, suppliedProof)) continue;
+                InetAddress signedAddress = InetAddress.getByName(address);
+                if (!isPrivateAddress(signedAddress)) continue;
+                String uploadUrl = "http://" + address + ":" + port + "/upload";
                 android.util.Log.i(TAG, "Authenticated receiver found at " + uploadUrl);
                 return uploadUrl;
             } catch (SocketTimeoutException timeout) {
@@ -658,13 +737,12 @@ public final class MainActivity extends Activity {
 
     private void done(String message) {
         runOnUiThread(() -> {
-            if (!busy && !awaitingImage) return;
             watchdog.removeCallbacks(captureTimeout);
+            boolean wasActive = busy || awaitingImage;
             awaitingImage = false;
-            closeCameraOnMainThread();
-            status.setText(message);
             busy = false;
-            stopCameraThread();
+            closeCameraOnMainThread();
+            if (wasActive) status.setText(message);
         });
     }
 

@@ -44,21 +44,38 @@ class ReceiverTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def upload(self, body=JPEG, token=TOKEN):
+        nonce = "00112233445566778899aabbccddeeff"
+        proof = hmac.new(
+            token.encode("ascii"),
+            f"{nonce} upload".encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
         return urlopen(
             Request(
                 self.endpoint,
                 data=body,
-                headers={"Content-Type": "image/jpeg", "X-Photo-Token": token},
+                headers={
+                    "Content-Type": "image/jpeg",
+                    "X-Photo-Nonce": nonce,
+                    "X-Photo-Proof": proof,
+                },
             ),
             timeout=2,
         )
 
     def raw_request(self, content_length, body):
+        nonce = "00112233445566778899aabbccddeeff"
+        proof = hmac.new(
+            TOKEN.encode("ascii"),
+            f"{nonce} upload".encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
         request = (
             b"POST /upload?filename=partial.jpg HTTP/1.1\r\n"
             b"Host: 127.0.0.1\r\n"
             b"Content-Type: image/jpeg\r\n"
-            + f"X-Photo-Token: {TOKEN}\r\n".encode("ascii")
+            + f"X-Photo-Nonce: {nonce}\r\n".encode("ascii")
+            + f"X-Photo-Proof: {proof}\r\n".encode("ascii")
             + f"Content-Length: {content_length}\r\n".encode("ascii")
             + b"Connection: close\r\n\r\n"
             + body
@@ -125,20 +142,24 @@ class DiscoveryTests(unittest.TestCase):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
             client.settimeout(1)
             client.sendto(
-                b"ROKID_PHOTO_BRIDGE_DISCOVER 2 " + nonce,
+                b"ROKID_PHOTO_BRIDGE_DISCOVER 3 " + nonce,
                 self.server.server_address,
             )
             response, _ = client.recvfrom(256)
         fields = response.split(b" ")
-        expected = hmac.new(TOKEN.encode("ascii"), nonce, hashlib.sha256).hexdigest()
-        self.assertEqual(fields[:3], [b"ROKID_PHOTO_BRIDGE", b"2", b"8765"])
-        self.assertTrue(hmac.compare_digest(fields[3].decode("ascii"), expected))
+        signed = b" ".join([nonce, fields[2], fields[3]])
+        expected = hmac.new(TOKEN.encode("ascii"), signed, hashlib.sha256).hexdigest()
+        self.assertEqual(fields[:2], [b"ROKID_PHOTO_BRIDGE", b"3"])
+        self.assertEqual(fields[2:4], [b"127.0.0.1", b"8765"])
+        self.assertTrue(hmac.compare_digest(fields[4].decode("ascii"), expected))
 
     def test_legacy_discovery_is_ignored(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
             client.settimeout(0.2)
             client.sendto(
-                b"ROKID_PHOTO_BRIDGE_DISCOVER 1", self.server.server_address
+                b"ROKID_PHOTO_BRIDGE_DISCOVER 2 "
+                b"00112233445566778899aabbccddeeff",
+                self.server.server_address,
             )
             with self.assertRaises(socket.timeout):
                 client.recvfrom(256)
