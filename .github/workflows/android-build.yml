@@ -27,3 +27,12 @@ jobs:
 
       - name: Build Android debug APK
         run: ./gradlew assembleDebug
+
+      - name: Verify distributed APK version
+        run: |
+          AAPT="$(ls -d "$ANDROID_HOME"/build-tools/*/ | tail -1)aapt"
+          APK_CODE="$("$AAPT" dump badging Photo-to-Mac.apk \
+            | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p")"
+          SRC_CODE="$(sed -n 's/.*versionCode *\([0-9]*\).*/\1/p' app/build.gradle)"
+          echo "Distributed APK: $APK_CODE / Source: $SRC_CODE"
+          test "$APK_CODE" = "$SRC_CODE"
