@@ -34,7 +34,7 @@ RokidとMacが同じWi-Fiにつながっていれば、撮った写真がMacの�
 
 ### 1. Photo to MacをMacへダウンロードする
 
-このGitHubページ上部の緑色の「Code」ボタンを押し、「Download ZIP」を選びます。ダウンロードしたZIPファイルをダブルクリックすると、Photo to Macのフォルダが開きます。
+[Photo to Macの最新版をダウンロード](https://github.com/ksuzukigh/rokid-photo-to-mac/releases/latest/download/Photo-to-Mac.zip)します。ダウンロードした`Photo-to-Mac.zip`をダブルクリックすると、Photo to Macのフォルダが開きます。
 
 ### 2. Macを写真の受取先にする
 
